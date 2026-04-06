@@ -1,4 +1,6 @@
-# Responses API Agent (Short-Term Memory)
+# Responses API Agent (Short-Term Memory) — Workshop
+
+This repo is based on the [agent-langgraph-short-term-memory](https://github.com/databricks/app-templates/tree/main/agent-langgraph-short-term-memory) app template but has been adapted for a workshop-style format.
 
 ## Build with AI Assistance
 
