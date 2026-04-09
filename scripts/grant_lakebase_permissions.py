@@ -4,14 +4,14 @@ After deploying the app, run this script to grant the app's SP access to all
 Lakebase schemas and tables used by the agent's memory.
 
 Usage:
-    # Get the SP client ID from your deployed app:
-    databricks apps get <app-name> --output json | jq -r '.service_principal_client_id'
+    # Using app name (recommended — automatically resolves the SP client ID):
+    uv run python scripts/grant_lakebase_permissions.py --app-name <app-name> --memory-type <type> --instance-name <name>
 
-    # Provisioned instance:
-    uv run python scripts/grant_lakebase_permissions.py <sp-client-id> --memory-type <type> --instance-name <name>
+    # Using explicit SP client ID:
+    uv run python scripts/grant_lakebase_permissions.py --sp-client-id <sp-client-id> --memory-type <type> --instance-name <name>
 
     # Autoscaling instance:
-    uv run python scripts/grant_lakebase_permissions.py <sp-client-id> --memory-type <type> --project <project> --branch <branch>
+    uv run python scripts/grant_lakebase_permissions.py --app-name <app-name> --memory-type <type> --project <project> --branch <branch>
 
     # Memory types: langgraph-short-term, langgraph-long-term, openai-short-term, long-running-agent
 """
@@ -80,10 +80,12 @@ def main():
         description="Grant Lakebase permissions to an app service principal."
     )
     parser.add_argument(
-        "sp_client_id",
-        help="Service principal client ID (UUID). Get it via: "
-        "databricks apps get <app-name> --output json "
-        "| jq -r '.service_principal_client_id'",
+        "--app-name",
+        help="Databricks app name. The SP client ID will be resolved automatically.",
+    )
+    parser.add_argument(
+        "--sp-client-id",
+        help="Service principal client ID (UUID). Alternative to --app-name.",
     )
     parser.add_argument(
         "--memory-type",
@@ -107,6 +109,36 @@ def main():
         help="Lakebase autoscaling branch name (default: LAKEBASE_AUTOSCALING_BRANCH from .env)",
     )
     args = parser.parse_args()
+
+    if not args.app_name and not args.sp_client_id:
+        print(
+            "Error: Provide either --app-name or --sp-client-id.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.app_name and args.sp_client_id:
+        print(
+            "Error: Provide only one of --app-name or --sp-client-id, not both.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.app_name:
+        from databricks.sdk import WorkspaceClient
+
+        w = WorkspaceClient()
+        app = w.apps.get(name=args.app_name)
+        sp_client_id = app.service_principal_client_id
+        if not sp_client_id:
+            print(
+                f"Error: App '{args.app_name}' has no service_principal_client_id.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Resolved SP client ID from app '{args.app_name}': {sp_client_id}")
+    else:
+        sp_client_id = args.sp_client_id
 
     has_provisioned = bool(args.instance_name)
     has_autoscaling = bool(args.project and args.branch)
@@ -132,7 +164,7 @@ def main():
         project=args.project or None,
         branch=args.branch or None,
     )
-    sp_id = args.sp_client_id
+    sp_id = sp_client_id
     memory_type = args.memory_type
 
     if has_provisioned:

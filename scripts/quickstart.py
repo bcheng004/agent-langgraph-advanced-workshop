@@ -18,7 +18,6 @@ Options:
     --lakebase-provisioned-name NAME   Provisioned Lakebase instance name
     --lakebase-autoscaling-project NAME  Autoscaling Lakebase project name
     --lakebase-autoscaling-branch NAME   Autoscaling Lakebase branch name
-    --lakebase-autoscaling-database NAME Autoscaling Lakebase postgres database name within a branch
     --skip-lakebase   Skip Lakebase setup (non-interactive / CI use)
     --app-name NAME   Existing Databricks app name to bind this bundle to
     -h, --help        Show this help message
@@ -870,7 +869,6 @@ def setup_lakebase(
     provisioned_name: str = None,
     autoscaling_project: str = None,
     autoscaling_branch: str = None,
-    autoscaling_database: str = None,
     purpose: str = "memory",
 ) -> dict:
     """Set up Lakebase instance.
@@ -911,10 +909,7 @@ def setup_lakebase(
         print_success(f"PGUSER set to '{username}'")
 
         update_env_file("PGDATABASE", "databricks_postgres")
-        print_success("PGDATABASE set to 'databricks_postgres' (using default Lakebase database: databricks_postgres)")
-
-        update_env_file("PGPORT", "5432")
-        print_success("PGPORT set to '5432'")
+        print_success("PGDATABASE set to 'databricks_postgres'")
 
         return {"type": "provisioned", "instance_name": provisioned_name}
 
@@ -939,20 +934,11 @@ def setup_lakebase(
         update_env_file("PGUSER", username)
         print_success(f"PGUSER set to '{username}'")
 
-        pg_database = autoscaling_database or "databricks_postgres"
-        update_env_file("PGDATABASE", pg_database)
-        if autoscaling_database:
-            print_success(f"PGDATABASE set to '{pg_database}' (using custom database: {pg_database})")
-        else:
-            print_success(f"PGDATABASE set to '{pg_database}' (using default Lakebase database: databricks_postgres)")
-
-        update_env_file("PGPORT", "5432")
-        print_success("PGPORT set to '5432'")
+        update_env_file("PGDATABASE", "databricks_postgres")
+        print_success("PGDATABASE set to 'databricks_postgres'")
 
         # Fetch database ID for the postgres resource in databricks.yml
-        database_id = _fetch_autoscaling_database_id(
-            profile_name, autoscaling_project, autoscaling_branch, database_name=autoscaling_database
-        )
+        database_id = _fetch_autoscaling_database_id(profile_name, autoscaling_project, autoscaling_branch)
 
         print_success(
             f"Lakebase autoscaling config saved to .env (project: {autoscaling_project}, branch: {autoscaling_branch})"
@@ -989,10 +975,7 @@ def setup_lakebase(
         print_success(f"PGUSER set to '{username}'")
 
         update_env_file("PGDATABASE", "databricks_postgres")
-        print_success("PGDATABASE set to 'databricks_postgres' (using default Lakebase database: databricks_postgres)")
-
-        update_env_file("PGPORT", "5432")
-        print_success("PGPORT set to '5432'")
+        print_success("PGDATABASE set to 'databricks_postgres'")
     else:
         project = selection["project"]
         branch = selection["branch"]
@@ -1015,10 +998,7 @@ def setup_lakebase(
         print_success(f"PGUSER set to '{username}'")
 
         update_env_file("PGDATABASE", "databricks_postgres")
-        print_success("PGDATABASE set to 'databricks_postgres' (using default Lakebase database: databricks_postgres)")
-
-        update_env_file("PGPORT", "5432")
-        print_success("PGPORT set to '5432'")
+        print_success("PGDATABASE set to 'databricks_postgres'")
 
         # Fetch database ID for the postgres resource in databricks.yml
         database_id = _fetch_autoscaling_database_id(profile_name, project, branch)
@@ -1031,73 +1011,48 @@ def setup_lakebase(
     return selection
 
 
-def _fetch_autoscaling_database_id(
-    profile_name: str, project: str, branch: str, database_name: str | None = None
-) -> str:
-    """Fetch the database ID for an autoscaling Lakebase branch.
+def _fetch_autoscaling_database_id(profile_name: str, project: str, branch: str) -> str:
+    """Fetch the first database ID for an autoscaling Lakebase branch.
 
-    Uses the Databricks SDK to list databases and match by postgres_status
-    if a database_name is provided, otherwise returns the first database.
-
-    Returns the database ID string.
+    Returns the database ID string, or empty string if not found.
     """
-    w = get_workspace_client(profile_name)
-    if not w:
-        print_error("Could not connect to Databricks. Check your CLI profile.")
-        sys.exit(1)
+    result = run_command(
+        [
+            "databricks",
+            "-p",
+            profile_name,
+            "api",
+            "get",
+            f"/api/2.0/postgres/projects/{project}/branches/{branch}/databases",
+            "--output",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout:
+        try:
+            data = json.loads(result.stdout)
+            databases = data.get("databases", [])
+            if databases:
+                # The database name is a full resource path like
+                # "projects/{project}/branches/{branch}/databases/{id}"
+                db_name = databases[0].get("name", "")
+                if db_name:
+                    # Extract just the database ID from the full path
+                    parts = db_name.split("/databases/")
+                    if len(parts) == 2:
+                        database_id = parts[1]
+                        print_success(f"Found Lakebase database ID: {database_id}")
+                        return database_id
+        except (json.JSONDecodeError, IndexError, KeyError):
+            pass
 
-    try:
-        parent = f"projects/{project}/branches/{branch}"
-        response = w.postgres.list_databases(parent=parent)
-        databases = list(response)
-
-        if not databases:
-            print_error(
-                f"No databases found for Lakebase branch '{branch}' in project '{project}'.\n"
-                "  You may need to create a database first."
-            )
-            sys.exit(1)
-
-        matched_db = None
-        if database_name:
-            # Match based on the database's postgres_status matching the provided name
-            for db in databases:
-                if hasattr(db, "status") and db.status.postgres_database == database_name:
-                    matched_db = db
-                    break
-            if not matched_db:
-                available = [
-                    f"  - {db.postgres_status}" for db in databases if hasattr(db, "status") and db.status.postgres_database
-                ]
-                print_error(
-                    f"No database with postgres_status '{database_name}' found.\n"
-                    f"  Available databases:\n" + "\n".join(available)
-                )
-                sys.exit(1)
-        else:
-            matched_db = databases[0]
-
-        # Database.name is the full resource path like
-        # "projects/{project}/branches/{branch}/databases/{id}"
-        db_full_name = matched_db.name
-        if db_full_name:
-            parts = db_full_name.split("/databases/")
-            if len(parts) == 2:
-                database_id = parts[1]
-                print_success(f"Found Lakebase database ID: {database_id}")
-                return database_id
-
-        print_error(f"Database found but could not extract ID from name: {db_full_name}")
-        sys.exit(1)
-
-    except Exception as e:
-        print_error(
-            f"Could not fetch databases for Lakebase branch.\n"
-            f"  Error: {e}\n"
-            "  The database resource path in databricks.yml requires a valid database ID.\n"
-            f"  You can find it by running: databricks api get /api/2.0/postgres/projects/{project}/branches/{branch}/databases"
-        )
-        sys.exit(1)
+    print_error(
+        "Could not fetch database ID for Lakebase branch.\n"
+        "  The database resource path in databricks.yml requires a valid database ID.\n"
+        "  You can find it by running: databricks api get /api/2.0/postgres/projects/{project}/branches/{branch}/databases"
+    )
+    sys.exit(1)
 
 
 def _replace_lakebase_env_vars(content: str, lakebase_config: dict) -> str:
@@ -1521,7 +1476,6 @@ Examples:
     uv run quickstart --host https://...  # Set up new profile with host
     uv run quickstart --lakebase-provisioned-name my-db   # Provisioned Lakebase
     uv run quickstart --lakebase-autoscaling-project proj --lakebase-autoscaling-branch br  # Autoscaling
-    uv run quickstart --lakebase-autoscaling-project proj --lakebase-autoscaling-branch br --lakebase-autoscaling-database mydb  # Autoscaling with custom database
     uv run quickstart --app-name my-existing-app  # Bind to existing Databricks app
     uv run quickstart --skip-lakebase    # Skip Lakebase setup
         """,
@@ -1549,11 +1503,6 @@ Examples:
     parser.add_argument(
         "--lakebase-autoscaling-branch",
         help="Autoscaling Lakebase branch name (use with --lakebase-autoscaling-project)",
-        metavar="NAME",
-    )
-    parser.add_argument(
-        "--lakebase-autoscaling-database",
-        help="Autoscaling Lakebase postgres database name within a branch (default: databricks_postgres)",
         metavar="NAME",
     )
     parser.add_argument(
@@ -1662,7 +1611,6 @@ Examples:
                     provisioned_name=args.lakebase_provisioned_name,
                     autoscaling_project=args.lakebase_autoscaling_project,
                     autoscaling_branch=args.lakebase_autoscaling_branch,
-                    autoscaling_database=args.lakebase_autoscaling_database,
                     purpose="memory",
                 )
         elif not args.skip_lakebase:

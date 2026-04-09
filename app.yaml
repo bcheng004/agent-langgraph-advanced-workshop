@@ -14,6 +14,6 @@ env:
   - name: MLFLOW_EXPERIMENT_ID
     valueFrom: experiment
   - name: LAKEBASE_AUTOSCALING_PROJECT
-    value: "bo-lakebase"
+    value: "bo-lb-memory"
   - name: LAKEBASE_AUTOSCALING_BRANCH
-    value: "bo-lakebase-branch"
+    value: "bo-lb-memory-branch"

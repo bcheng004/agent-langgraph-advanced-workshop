@@ -207,6 +207,9 @@ e2e-chatbot-app-next/
 **/.env
 **/.env.local
 
+# OMC
+.omc/
+
 # Claude Code - track skills and settings
 .claude/*
 !.claude/settings.json

@@ -4,7 +4,7 @@ bundle:
 resources:
   apps:
     agent_langgraph_short_term_memory:
-      name: "bo-test-workshop"
+      name: "bo-test"
       description: "LangGraph agent application with short-term memory"
       source_code_path: ./
       config:
@@ -23,9 +23,9 @@ resources:
           - name: MLFLOW_EXPERIMENT_ID
             value_from: "experiment"
           - name: LAKEBASE_AUTOSCALING_PROJECT
-            value: "bo-lakebase"
+            value: "bo-lb-memory"
           - name: LAKEBASE_AUTOSCALING_BRANCH
-            value: "bo-lakebase-branch"
+            value: "bo-lb-memory-branch"
 
       # Resources which this app has access to
       resources:
@@ -36,8 +36,8 @@ resources:
         # See: .claude/skills/add-tools/examples/lakebase-autoscaling.yaml
         - name: 'postgres'
           postgres:
-            branch: "projects/bo-lakebase/branches/bo-lakebase-branch"
-            database: "projects/bo-lakebase/branches/bo-lakebase-branch/databases/db-83pv-enwl7qwit9"
+            branch: "projects/bo-lb-memory/branches/bo-lb-memory-branch"
+            database: "projects/bo-lb-memory/branches/bo-lb-memory-branch/databases/db-xv5w-00ibj61nyy"
             permission: 'CAN_CONNECT_AND_CREATE'
 
 targets:
