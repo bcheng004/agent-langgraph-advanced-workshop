@@ -37,6 +37,7 @@ setup = [
 
 [tool.uv]
 default-groups = ["dev", "setup"]
+# index-url = "https://pypi-proxy.dev.databricks.com/simple/"
 
 [project.scripts]
 quickstart = "scripts.quickstart:main"
