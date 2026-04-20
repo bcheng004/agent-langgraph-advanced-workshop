@@ -1,22 +1,16 @@
 import logging
-import os
 from datetime import datetime
 from typing import Any, AsyncGenerator, Optional, Sequence, TypedDict
 
-import litellm
 import mlflow
 from databricks.sdk import WorkspaceClient
-from databricks_langchain import (
-    AsyncCheckpointSaver,
-    ChatDatabricks,
-    DatabricksMCPServer,
-    DatabricksMultiServerMCPClient,
-)
+from databricks_langchain import ChatDatabricks
 from fastapi import HTTPException
 from langchain.agents import create_agent
 from langchain_core.messages import AnyMessage
 from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
+from langgraph.store.base import BaseStore
 from mlflow.genai.agent_server import invoke, stream
 from mlflow.types.responses import (
     ResponsesAgentRequest,
@@ -26,18 +20,28 @@ from mlflow.types.responses import (
 )
 from typing_extensions import Annotated
 
+from agent_server.prompts import SYSTEM_PROMPT
 from agent_server.utils import (
-    _get_lakebase_access_error_message,
     _get_or_create_thread_id,
-    get_databricks_host_from_env,
+    get_user_workspace_client,
+    init_mcp_client,
     process_agent_astream_events,
+)
+from agent_server.utils_memory import (
+    get_lakebase_access_error_message,
+    get_user_id,
+    init_lakebase_config,
+    lakebase_context,
+    memory_tools,
 )
 
 logger = logging.getLogger(__name__)
 mlflow.langchain.autolog()
 logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
-litellm.suppress_debug_info = True
 sp_workspace_client = WorkspaceClient()
+
+LLM_ENDPOINT_NAME = "databricks-claude-sonnet-4-5"
+LAKEBASE_CONFIG = init_lakebase_config()
 
 
 @tool
@@ -46,49 +50,18 @@ def get_current_time() -> str:
     return datetime.now().isoformat()
 
 
-############################################
-# Configuration
-############################################
-LLM_ENDPOINT_NAME = "databricks-claude-sonnet-4-5"
-SYSTEM_PROMPT = "You are a helpful assistant. Use the available tools to answer questions."
-LAKEBASE_INSTANCE_NAME = os.getenv("LAKEBASE_INSTANCE_NAME") or None
-LAKEBASE_AUTOSCALING_PROJECT = os.getenv("LAKEBASE_AUTOSCALING_PROJECT") or None
-LAKEBASE_AUTOSCALING_BRANCH = os.getenv("LAKEBASE_AUTOSCALING_BRANCH") or None
-
-_has_autoscaling = LAKEBASE_AUTOSCALING_PROJECT and LAKEBASE_AUTOSCALING_BRANCH
-if not LAKEBASE_INSTANCE_NAME and not _has_autoscaling:
-    raise ValueError(
-        "Lakebase configuration is required but not set. "
-        "Please set one of the following in your environment:\n"
-        "  Option 1 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
-        "  Option 2 (autoscaling): LAKEBASE_AUTOSCALING_PROJECT=<project> and LAKEBASE_AUTOSCALING_BRANCH=<branch>\n"
-    )
-
-
 class StatefulAgentState(TypedDict, total=False):
     messages: Annotated[Sequence[AnyMessage], add_messages]
     custom_inputs: dict[str, Any]
     custom_outputs: dict[str, Any]
 
 
-def init_mcp_client(workspace_client: WorkspaceClient) -> DatabricksMultiServerMCPClient:
-    host_name = get_databricks_host_from_env()
-    return DatabricksMultiServerMCPClient(
-        [
-            DatabricksMCPServer(
-                name="system-ai",
-                url=f"{host_name}/api/2.0/mcp/functions/system/ai",
-                workspace_client=workspace_client,
-            ),
-        ]
-    )
-
-
 async def init_agent(
+    store: BaseStore,
     workspace_client: Optional[WorkspaceClient] = None,
     checkpointer: Optional[Any] = None,
 ):
-    tools = [get_current_time]
+    tools = [get_current_time] + memory_tools()
     # To use MCP server tools instead, uncomment the below lines:
     # mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
     # try:
@@ -103,23 +76,23 @@ async def init_agent(
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,
+        store=store,
         state_schema=StatefulAgentState,
     )
 
 
 @invoke()
 async def invoke_handler(request: ResponsesAgentRequest) -> ResponsesAgentResponse:
-    thread_id = _get_or_create_thread_id(request)
-    request.custom_inputs = dict(request.custom_inputs or {})
-    request.custom_inputs["thread_id"] = thread_id
-
     outputs = [
         event.item
         async for event in stream_handler(request)
         if event.type == "response.output_item.done"
     ]
 
-    return ResponsesAgentResponse(output=outputs, custom_outputs={"thread_id": thread_id})
+    custom_outputs: dict[str, Any] = {}
+    if user_id := get_user_id(request):
+        custom_outputs["user_id"] = user_id
+    return ResponsesAgentResponse(output=outputs, custom_outputs=custom_outputs)
 
 
 @stream()
@@ -129,38 +102,41 @@ async def stream_handler(
     thread_id = _get_or_create_thread_id(request)
     mlflow.update_current_trace(metadata={"mlflow.trace.session": thread_id})
 
-    config = {"configurable": {"thread_id": thread_id}}
+    user_id = get_user_id(request)
+    if not user_id:
+        logger.warning("No user_id provided - memory features will not be available")
+
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    if user_id:
+        config["configurable"]["user_id"] = user_id
+
     input_state: dict[str, Any] = {
         "messages": to_chat_completions_input([i.model_dump() for i in request.input]),
         "custom_inputs": dict(request.custom_inputs or {}),
     }
 
     try:
-        async with AsyncCheckpointSaver(
-            instance_name=LAKEBASE_INSTANCE_NAME,
-            project=LAKEBASE_AUTOSCALING_PROJECT,
-            branch=LAKEBASE_AUTOSCALING_BRANCH,
-        ) as checkpointer:
-            await checkpointer.setup()
+        async with lakebase_context(LAKEBASE_CONFIG) as (checkpointer, store):
+            config["configurable"]["store"] = store
+
             # By default, uses service principal credentials.
             # For on-behalf-of user authentication, pass get_user_workspace_client() to init_agent.
-            agent = await init_agent(checkpointer=checkpointer)
+            agent = await init_agent(store=store, checkpointer=checkpointer)
 
             async for event in process_agent_astream_events(
-                agent.astream(
-                    input_state,
-                    config,
-                    stream_mode=["updates", "messages"],
-                )
+                agent.astream(input_state, config, stream_mode=["updates", "messages"])
             ):
                 yield event
     except Exception as e:
         error_msg = str(e).lower()
         # Check for Lakebase access/connection errors
-        if any(keyword in error_msg for keyword in ["lakebase", "pg_hba", "postgres", "database instance"]):
-            logger.error(f"Lakebase access error: {e}")
-            lakebase_desc = LAKEBASE_INSTANCE_NAME or f"{LAKEBASE_AUTOSCALING_PROJECT}/{LAKEBASE_AUTOSCALING_BRANCH}"
+        if any(
+            keyword in error_msg
+            for keyword in ["lakebase", "pg_hba", "postgres", "database instance"]
+        ):
+            logger.error("Lakebase access error: %s", e)
             raise HTTPException(
-                status_code=503, detail=_get_lakebase_access_error_message(lakebase_desc)
+                status_code=503,
+                detail=get_lakebase_access_error_message(LAKEBASE_CONFIG.description),
             ) from e
         raise

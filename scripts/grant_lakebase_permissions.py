@@ -32,29 +32,27 @@ load_dotenv()
 
 # Per-memory-type schema -> table definitions.
 MEMORY_TYPE_SCHEMAS: dict[str, dict[str, list[str]]] = {
-    "langgraph-short-term": {
+    "langgraph": {
         "public": [
             "checkpoint_migrations",
             "checkpoint_writes",
             "checkpoints",
             "checkpoint_blobs",
-        ],
-    },
-    "langgraph-long-term": {
-        "public": [
             "store_migrations",
             "store",
             "store_vectors",
             "vector_migrations",
         ],
+        "agent_server": [
+            "responses",
+            "messages",
+        ],
     },
-    "openai-short-term": {
+    "openai": {
         "public": [
             "agent_sessions",
             "agent_messages",
         ],
-    },
-    "long-running-agent": {
         "agent_server": [
             "responses",
             "messages",
@@ -62,10 +60,11 @@ MEMORY_TYPE_SCHEMAS: dict[str, dict[str, list[str]]] = {
     },
 }
 
+
 # Memory types that need sequence privileges (auto-increment columns)
 NEEDS_SEQUENCES = {
-    "openai-short-term": ["public"],
-    "long-running-agent": ["agent_server"],
+    "openai": ["public", "agent_server"],
+    "langgraph": ["agent_server"],
 }
 
 # Shared schemas that need sequence privileges for all memory types.
