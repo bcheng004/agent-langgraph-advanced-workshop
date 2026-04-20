@@ -227,3 +227,6 @@ load-test-runs/
 
 # oh-my-claudecode state
 .omc/
+
+# local chatbot app (not part of template)
+e2e-chatbot-app-next/
