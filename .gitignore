@@ -224,3 +224,6 @@ sketch
 **/.env
 **/.env.local
 load-test-runs/
+
+# oh-my-claudecode state
+.omc/
