@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 # Need to import the agent to register the functions with the server
 import agent_server.agent  # noqa: F401
 
-from agent_server.agent import LAKEBASE_CONFIG
 from agent_server.utils import replace_fake_id
-from agent_server.utils_memory import run_lakebase_setup
+from agent_server.utils_memory import init_lakebase_config
+
+# Lakebase is only used for long-running background task persistence. Agent memory lives in
+# Databricks Managed Sessions / Managed Memory (see agent_server/utils_memory.py).
+LAKEBASE_CONFIG = init_lakebase_config()
 
 
 class AgentServer(LongRunningAgentServer):
@@ -50,7 +53,6 @@ _original_lifespan = app.router.lifespan_context
 
 @asynccontextmanager
 async def _lifespan(app):
-    await run_lakebase_setup(LAKEBASE_CONFIG)
     try:
         async with _original_lifespan(app):
             yield

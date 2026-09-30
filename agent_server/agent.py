@@ -5,12 +5,11 @@ from typing import Any, AsyncGenerator, Optional, Sequence, TypedDict
 import mlflow
 from databricks.sdk import WorkspaceClient
 from databricks_langchain import ChatDatabricks
-from fastapi import HTTPException
+from databricks_mason.langgraph import checkpointer, thread_config
 from langchain.agents import create_agent
 from langchain_core.messages import AnyMessage
 from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
-from langgraph.store.base import BaseStore
 from mlflow.genai.agent_server import invoke, stream
 from mlflow.types.responses import (
     ResponsesAgentRequest,
@@ -28,10 +27,8 @@ from agent_server.utils import (
     process_agent_astream_events,
 )
 from agent_server.utils_memory import (
-    get_lakebase_access_error_message,
+    get_session_store_name,
     get_user_id,
-    init_lakebase_config,
-    lakebase_context,
     memory_tools,
 )
 
@@ -41,7 +38,6 @@ logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
 sp_workspace_client = WorkspaceClient()
 
 LLM_ENDPOINT_NAME = "databricks-claude-sonnet-4-5"
-LAKEBASE_CONFIG = init_lakebase_config()
 
 
 @tool
@@ -56,11 +52,7 @@ class StatefulAgentState(TypedDict, total=False):
     custom_outputs: dict[str, Any]
 
 
-async def init_agent(
-    store: BaseStore,
-    workspace_client: Optional[WorkspaceClient] = None,
-    checkpointer: Optional[Any] = None,
-):
+async def init_agent(workspace_client: Optional[WorkspaceClient] = None):
     tools = [get_current_time] + memory_tools()
     # To use MCP server tools instead, uncomment the below lines:
     # mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
@@ -75,8 +67,9 @@ async def init_agent(
         model=model,
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
-        checkpointer=checkpointer,
-        store=store,
+        # Short-term memory: Databricks Managed Sessions via databricks-mason. Persists LangGraph
+        # checkpoints to AGENT_SESSION_STORE; falls back to an in-process InMemorySaver when unset.
+        checkpointer=checkpointer(get_session_store_name()),
         state_schema=StatefulAgentState,
     )
 
@@ -106,7 +99,8 @@ async def stream_handler(
     if not user_id:
         logger.warning("No user_id provided - memory features will not be available")
 
-    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    # actor_id partitions sessions per user in the managed session store (defaults to thread_id).
+    config: dict[str, Any] = thread_config(thread_id, actor=user_id)
     if user_id:
         config["configurable"]["user_id"] = user_id
 
@@ -115,28 +109,11 @@ async def stream_handler(
         "custom_inputs": dict(request.custom_inputs or {}),
     }
 
-    try:
-        async with lakebase_context(LAKEBASE_CONFIG) as (checkpointer, store):
-            config["configurable"]["store"] = store
+    # By default, uses service principal credentials.
+    # For on-behalf-of user authentication, pass get_user_workspace_client() to init_agent.
+    agent = await init_agent()
 
-            # By default, uses service principal credentials.
-            # For on-behalf-of user authentication, pass get_user_workspace_client() to init_agent.
-            agent = await init_agent(store=store, checkpointer=checkpointer)
-
-            async for event in process_agent_astream_events(
-                agent.astream(input_state, config, stream_mode=["updates", "messages"])
-            ):
-                yield event
-    except Exception as e:
-        error_msg = str(e).lower()
-        # Check for Lakebase access/connection errors
-        if any(
-            keyword in error_msg
-            for keyword in ["lakebase", "pg_hba", "postgres", "database instance"]
-        ):
-            logger.error("Lakebase access error: %s", e)
-            raise HTTPException(
-                status_code=503,
-                detail=get_lakebase_access_error_message(LAKEBASE_CONFIG.description),
-            ) from e
-        raise
+    async for event in process_agent_astream_events(
+        agent.astream(input_state, config, stream_mode=["updates", "messages"])
+    ):
+        yield event

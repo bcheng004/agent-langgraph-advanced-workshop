@@ -1,18 +1,17 @@
-import json
+import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 
 from databricks.sdk import WorkspaceClient
-from databricks_langchain import AsyncCheckpointSaver, AsyncDatabricksStore
+from databricks_mason import MasonClient
+from databricks_mason.memory_store import MemoryStore
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langgraph.store.base import BaseStore
 from mlflow.types.responses import ResponsesAgentRequest
 
-from agent_server.utils import _is_databricks_app_env
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +22,6 @@ class LakebaseConfig:
     autoscaling_endpoint: Optional[str]
     autoscaling_project: Optional[str]
     autoscaling_branch: Optional[str]
-    embedding_endpoint: str = "databricks-gte-large-en"  # override via DATABRICKS_EMBEDDING_ENDPOINT
-    embedding_dims: int = 1024
 
     @property
     def description(self) -> str:
@@ -32,6 +29,11 @@ class LakebaseConfig:
 
 
 def init_lakebase_config() -> LakebaseConfig:
+    """Lakebase config for the long-running server's background-task persistence.
+
+    Agent memory no longer lives in Lakebase (see Managed Sessions / Managed Memory below), so this
+    is optional: when unset, background mode is disabled but the agent still works.
+    """
     endpoint = os.getenv("LAKEBASE_AUTOSCALING_ENDPOINT") or None
     raw_name = os.getenv("LAKEBASE_INSTANCE_NAME") or None
     project = os.getenv("LAKEBASE_AUTOSCALING_PROJECT") or None
@@ -39,13 +41,8 @@ def init_lakebase_config() -> LakebaseConfig:
 
     has_autoscaling = project and branch
     if not endpoint and not raw_name and not has_autoscaling:
-        raise ValueError(
-            "Lakebase configuration is required but not set. "
-            "Please set one of the following in your environment:\n"
-            "  Option 1 (autoscaling endpoint): LAKEBASE_AUTOSCALING_ENDPOINT=<your-endpoint-name>\n"
-            "  Option 2 (autoscaling): LAKEBASE_AUTOSCALING_PROJECT=<project> and LAKEBASE_AUTOSCALING_BRANCH=<branch>\n"
-            "  Option 3 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
-        )
+        logger.info("No Lakebase configured - long-running background mode will be disabled.")
+        return LakebaseConfig(None, None, None, None)
 
     # Priority: endpoint > project+branch > instance_name (mutually exclusive in the library)
     if endpoint:
@@ -61,13 +58,11 @@ def init_lakebase_config() -> LakebaseConfig:
         project = None
         branch = None
 
-    embedding_endpoint = os.getenv("DATABRICKS_EMBEDDING_ENDPOINT", "databricks-gte-large-en")
     return LakebaseConfig(
         instance_name=instance_name,
         autoscaling_endpoint=endpoint,
         autoscaling_project=project,
         autoscaling_branch=branch,
-        embedding_endpoint=embedding_endpoint,
     )
 
 
@@ -133,14 +128,6 @@ def resolve_lakebase_instance_name(
     )
 
 
-async def run_lakebase_setup(config: LakebaseConfig) -> None:
-    """Run database migrations for checkpoint and store tables. Call once at app startup."""
-    async with lakebase_context(config) as (checkpointer, store):
-        await checkpointer.setup()
-        await store.setup()
-    logger.info("Lakebase setup complete")
-
-
 def get_user_id(request: ResponsesAgentRequest) -> Optional[str]:
     custom_inputs = dict(request.custom_inputs or {})
     if "user_id" in custom_inputs:
@@ -150,50 +137,40 @@ def get_user_id(request: ResponsesAgentRequest) -> Optional[str]:
     return None
 
 
-def get_lakebase_access_error_message(lakebase_instance_name: str) -> str:
-    """Generate a helpful error message for Lakebase access issues."""
-    if _is_databricks_app_env():
-        app_name = os.getenv("DATABRICKS_APP_NAME")
-        return (
-            f"Failed to connect to Lakebase instance '{lakebase_instance_name}'. "
-            f"The App Service Principal for '{app_name}' may not have access.\n\n"
-            "To fix this:\n"
-            "1. Go to the Databricks UI and navigate to your app\n"
-            "2. Click 'Edit' → 'App resources' → 'Add resource'\n"
-            "3. Add your Lakebase instance as a resource\n"
-            "4. Grant the necessary permissions on your Lakebase instance. "
-            "See the README section 'Grant Lakebase permissions to your App's Service Principal' for the SQL commands."
-        )
-    else:
-        return (
-            f"Failed to connect to Lakebase instance '{lakebase_instance_name}'. "
-            "Please verify:\n"
-            "1. The instance name is correct\n"
-            "2. You have the necessary permissions to access the instance\n"
-            "3. Your Databricks authentication is configured correctly"
-        )
+def get_memory_store_name() -> Optional[str]:
+    """Managed memory store (long-term memory). Unset disables the memory tools."""
+    return os.getenv("AGENT_MEMORY_STORE") or None
 
 
-@asynccontextmanager
-async def lakebase_context(config: LakebaseConfig):
-    """Yield (checkpointer, store) for short-term and long-term memory."""
-    async with AsyncCheckpointSaver(
-        instance_name=config.instance_name,
-        autoscaling_endpoint=config.autoscaling_endpoint,
-        project=config.autoscaling_project,
-        branch=config.autoscaling_branch,
-    ) as checkpointer, AsyncDatabricksStore(
-        instance_name=config.instance_name,
-        autoscaling_endpoint=config.autoscaling_endpoint,
-        project=config.autoscaling_project,
-        branch=config.autoscaling_branch,
-        embedding_endpoint=config.embedding_endpoint,
-        embedding_dims=config.embedding_dims,
-    ) as store:
-        yield checkpointer, store
+def get_session_store_name() -> Optional[str]:
+    """Managed session store (short-term memory). Unset falls back to an in-process checkpointer."""
+    return os.getenv("AGENT_SESSION_STORE") or None
+
+
+@lru_cache(maxsize=1)
+def _memory_store(store_name: str) -> MemoryStore:
+    return MasonClient(WorkspaceClient()).memory_stores.get(store_name)
+
+
+def _memory_path(memory_key: str) -> str:
+    return f"/user_memories/{memory_key.strip('/')}.md"
+
+
+def _find_memory(store: MemoryStore, actor_id: str, path: str):
+    return next((m for m in store.list(actor_id=actor_id, path_prefix=path) if m.path == path), None)
 
 
 def memory_tools():
+    """Long-term memory tools backed by Databricks Managed Memory (databricks-mason).
+
+    ``actor_id`` comes from the trusted run config (the signed-in user), never from the model, so
+    each user's memories stay partitioned. Mason's client is synchronous, so calls run in a thread.
+    """
+    store_name = get_memory_store_name()
+    if not store_name:
+        logger.warning("AGENT_MEMORY_STORE not set - long-term memory tools are disabled")
+        return []
+
     @tool
     async def get_user_memory(query: str, config: RunnableConfig) -> str:
         """Search for relevant information about the user from long-term memory."""
@@ -201,40 +178,37 @@ def memory_tools():
         if not user_id:
             return "Memory not available - no user_id provided."
 
-        store: Optional[BaseStore] = config.get("configurable", {}).get("store")
-        if not store:
-            return "Memory not available - store not configured."
-
-        namespace = ("user_memories", user_id.replace(".", "-"))
-        results = await store.asearch(namespace, query=query, limit=5)
+        store = _memory_store(store_name)
+        results = await asyncio.to_thread(store.search, actor_id=user_id, query=query, limit=5)
 
         if not results:
             return "No memories found for this user."
 
-        memory_items = [f"- [{item.key}]: {json.dumps(item.value)}" for item in results]
+        memory_items = [f"- [{r.memory.path}]: {r.memory.content}" for r in results]
         return f"Found {len(results)} relevant memories:\n" + "\n".join(memory_items)
 
     @tool
-    async def save_user_memory(memory_key: str, memory_data_json: str, config: RunnableConfig) -> str:
-        """Save information about the user to long-term memory."""
+    async def save_user_memory(memory_key: str, content: str, config: RunnableConfig) -> str:
+        """Save information about the user to long-term memory.
+
+        memory_key is a short slug for the topic (e.g. "preferences/language"); saving to an
+        existing key overwrites it. content is the fact to remember, in plain text.
+        """
         user_id = config.get("configurable", {}).get("user_id")
         if not user_id:
             return "Cannot save memory - no user_id provided."
 
-        store: Optional[BaseStore] = config.get("configurable", {}).get("store")
-        if not store:
-            return "Cannot save memory - store not configured."
+        store = _memory_store(store_name)
+        path = _memory_path(memory_key)
 
-        namespace = ("user_memories", user_id.replace(".", "-"))
+        def _upsert():
+            if existing := _find_memory(store, user_id, path):
+                existing.update(content=content)
+            else:
+                store.add(actor_id=user_id, path=path, content=content, description=memory_key)
 
-        try:
-            memory_data = json.loads(memory_data_json)
-            if not isinstance(memory_data, dict):
-                return f"Failed: memory_data must be a JSON object, not {type(memory_data).__name__}"
-            await store.aput(namespace, memory_key, memory_data)
-            return f"Successfully saved memory '{memory_key}' for user."
-        except json.JSONDecodeError as e:
-            return f"Failed to save memory: Invalid JSON - {e}"
+        await asyncio.to_thread(_upsert)
+        return f"Successfully saved memory '{memory_key}' for user."
 
     @tool
     async def delete_user_memory(memory_key: str, config: RunnableConfig) -> str:
@@ -243,12 +217,17 @@ def memory_tools():
         if not user_id:
             return "Cannot delete memory - no user_id provided."
 
-        store: Optional[BaseStore] = config.get("configurable", {}).get("store")
-        if not store:
-            return "Cannot delete memory - store not configured."
+        store = _memory_store(store_name)
+        path = _memory_path(memory_key)
 
-        namespace = ("user_memories", user_id.replace(".", "-"))
-        await store.adelete(namespace, memory_key)
+        def _delete() -> bool:
+            if existing := _find_memory(store, user_id, path):
+                existing.delete()
+                return True
+            return False
+
+        if not await asyncio.to_thread(_delete):
+            return f"No memory found with key '{memory_key}'."
         return f"Successfully deleted memory '{memory_key}' for user."
 
     return [get_user_memory, save_user_memory, delete_user_memory]

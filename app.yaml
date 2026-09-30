@@ -15,4 +15,9 @@ env:
   - name: MLFLOW_EXPERIMENT_ID
     valueFrom: "experiment"
   - name: LAKEBASE_AUTOSCALING_ENDPOINT
+    value_from: "postgres"
     valueFrom: "postgres"
+  - name: AGENT_MEMORY_STORE
+    value: "agent-langgraph-advanced-memory"
+  - name: AGENT_SESSION_STORE
+    value: "agent-langgraph-advanced-sessions"

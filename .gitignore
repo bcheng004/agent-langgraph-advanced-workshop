@@ -230,3 +230,4 @@ load-test-runs/
 
 # local chatbot app (not part of template)
 e2e-chatbot-app-next/
+.env.fevm.bak

@@ -5,7 +5,7 @@ bundle:
 resources:
   apps:
     agent_langgraph_advanced:
-      name: "bo-test-advanced-workshop"
+      name: "test-workshop-app"
       description: "LangGraph agent application with short-term and long-term memory"
       source_code_path: ./
       config:
@@ -25,8 +25,12 @@ resources:
             value_from: "experiment"
           - name: LAKEBASE_AUTOSCALING_ENDPOINT
             value_from: "postgres"
-          - name: DATABRICKS_EMBEDDING_ENDPOINT
-            value: "databricks-gte-large-en"
+          # Managed Memory (long-term) and Managed Sessions (short-term) stores, via databricks-mason.
+          # Create them and grant the app SP access with: uv run setup-agent-stores --app <app-name>
+          - name: AGENT_MEMORY_STORE
+            value: "agent-langgraph-advanced-memory"
+          - name: AGENT_SESSION_STORE
+            value: "agent-langgraph-advanced-sessions"
 
       # Resources which this app has access to
       resources:
@@ -36,8 +40,8 @@ resources:
             permission: 'CAN_MANAGE'
         - name: 'postgres'
           postgres:
-            branch: "projects/bo-test-lakebase-advanced/branches/bo-test-lakebase-advanced-branch"
-            database: "projects/bo-test-lakebase-advanced/branches/bo-test-lakebase-advanced-branch/databases/db-tj43-gaypl21b57"
+            branch: "projects/test-workshop-lakebase/branches/test-workshop-lakebase-branch"
+            database: "projects/test-workshop-lakebase/branches/test-workshop-lakebase-branch/databases/databricks-postgres"
             permission: 'CAN_CONNECT_AND_CREATE'
 
 targets:

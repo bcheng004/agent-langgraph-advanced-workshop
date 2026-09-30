@@ -19,6 +19,7 @@ dependencies = [
     "langchain-mcp-adapters>=0.2.1",
     "python-dotenv>=1.2.1",
     "opentelemetry-exporter-otlp-proto-grpc>=1.25.0",
+    "databricks-mason[langgraph]>=0.2.0",
 ]
 
 [build-system]
@@ -52,3 +53,4 @@ agent-evaluate = "agent_server.evaluate_agent:evaluate"
 discover-tools = "scripts.discover_tools:main"
 preflight = "scripts.preflight:main"
 grant-lakebase-permissions = "scripts.grant_lakebase_permissions:main"
+setup-agent-stores = "scripts.setup_agent_stores:main"
