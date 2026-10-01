@@ -5,9 +5,13 @@ bundle:
 resources:
   apps:
     agent_langgraph_advanced:
-      name: "bo-test-advanced-workshop"
+      name: "test-workshop"
       description: "LangGraph agent application with short-term and long-term memory"
       source_code_path: ./
+      # OAuth scopes for on-behalf-of-user authorization
+      user_api_scopes:
+        - ai-gateway
+        - postgres
       config:
         command: ["uv", "run", "start-app"]
         env:
@@ -32,12 +36,12 @@ resources:
       resources:
         - name: 'experiment'
           experiment:
-            experiment_id: "3075609125705777"
+            experiment_id: "790905226841199"
             permission: 'CAN_MANAGE'
         - name: 'postgres'
           postgres:
-            branch: "projects/bo-test-lakebase-advanced/branches/bo-test-lakebase-advanced-branch"
-            database: "projects/bo-test-lakebase-advanced/branches/bo-test-lakebase-advanced-branch/databases/db-tj43-gaypl21b57"
+            branch: "projects/test-lakebase/branches/test-lakebase-branch"
+            database: "projects/test-lakebase/branches/test-lakebase-branch/databases/databricks-postgres"
             permission: 'CAN_CONNECT_AND_CREATE'
 
 targets:
